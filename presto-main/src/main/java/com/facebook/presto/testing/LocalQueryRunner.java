@@ -96,8 +96,10 @@ import com.facebook.presto.spi.block.BlockEncodingSerde;
 import com.facebook.presto.spi.connector.ConnectorFactory;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spiller.FileSingleStreamSpillerFactory;
+import com.facebook.presto.spiller.GenericPartitioningSpillerFactory;
 import com.facebook.presto.spiller.GenericSpillerFactory;
 import com.facebook.presto.spiller.NodeSpillConfig;
+import com.facebook.presto.spiller.PartitioningSpillerFactory;
 import com.facebook.presto.spiller.SpillerFactory;
 import com.facebook.presto.spiller.SpillerStats;
 import com.facebook.presto.split.PageSinkManager;
@@ -180,9 +182,12 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 
+import static com.facebook.presto.SystemSessionProperties.getFilterAndProjectMinOutputPageRowCount;
+import static com.facebook.presto.SystemSessionProperties.getFilterAndProjectMinOutputPageSize;
 import static com.facebook.presto.execution.SqlQueryManager.unwrapExecuteStatement;
 import static com.facebook.presto.execution.SqlQueryManager.validateParameters;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
+import static com.facebook.presto.sql.ParsingUtil.createParsingOptions;
 import static com.facebook.presto.sql.testing.TreeAssertions.assertFormattedSql;
 import static com.facebook.presto.testing.TestingSession.TESTING_CATALOG;
 import static com.facebook.presto.testing.TestingSession.createBogusTestingCatalog;
@@ -223,6 +228,7 @@ public class LocalQueryRunner
     private final TransactionManager transactionManager;
     private final FileSingleStreamSpillerFactory singleStreamSpillerFactory;
     private final SpillerFactory spillerFactory;
+    private final PartitioningSpillerFactory partitioningSpillerFactory;
 
     private final PageFunctionCompiler pageFunctionCompiler;
     private final ExpressionCompiler expressionCompiler;
@@ -282,7 +288,7 @@ public class LocalQueryRunner
         this.sqlParser = new SqlParser();
         this.nodeManager = new InMemoryNodeManager();
         this.typeRegistry = new TypeRegistry();
-        this.pageSorter = new PagesIndexPageSorter(new PagesIndex.TestingFactory());
+        this.pageSorter = new PagesIndexPageSorter(new PagesIndex.TestingFactory(false));
         this.pageIndexerFactory = new GroupByHashPageIndexerFactory(new JoinCompiler());
         this.indexManager = new IndexManager();
         NodeScheduler nodeScheduler = new NodeScheduler(
@@ -362,6 +368,7 @@ public class LocalQueryRunner
                 defaultSession.getRemoteUserAddress(),
                 defaultSession.getUserAgent(),
                 defaultSession.getClientInfo(),
+                defaultSession.getClientTags(),
                 defaultSession.getStartTime(),
                 defaultSession.getSystemProperties(),
                 defaultSession.getConnectorProperties(),
@@ -387,6 +394,7 @@ public class LocalQueryRunner
 
         SpillerStats spillerStats = new SpillerStats();
         this.singleStreamSpillerFactory = new FileSingleStreamSpillerFactory(blockEncodingSerde, spillerStats, featuresConfig);
+        this.partitioningSpillerFactory = new GenericPartitioningSpillerFactory(this.singleStreamSpillerFactory);
         this.spillerFactory = new GenericSpillerFactory(singleStreamSpillerFactory);
     }
 
@@ -609,7 +617,7 @@ public class LocalQueryRunner
             System.out.println(PlanPrinter.textLogicalPlan(plan.getRoot(), plan.getTypes(), metadata, costCalculator, session));
         }
 
-        SubPlan subplan = PlanFragmenter.createSubPlans(session, metadata, plan);
+        SubPlan subplan = PlanFragmenter.createSubPlans(session, metadata, plan, true);
         if (!subplan.getChildren().isEmpty()) {
             throw new AssertionError("Expected subplan to have no children");
         }
@@ -631,8 +639,10 @@ public class LocalQueryRunner
                 new CompilerConfig().setInterpreterEnabled(false), // make sure tests fail if compiler breaks
                 new TaskManagerConfig().setTaskConcurrency(4),
                 spillerFactory,
+                singleStreamSpillerFactory,
+                partitioningSpillerFactory,
                 blockEncodingSerde,
-                new PagesIndex.TestingFactory(),
+                new PagesIndex.TestingFactory(false),
                 new JoinCompiler(),
                 new LookupJoinOperators(new JoinProbeCompiler()));
 
@@ -691,7 +701,7 @@ public class LocalQueryRunner
         }
 
         for (DriverFactory driverFactory : localExecutionPlan.getDriverFactories()) {
-            driverFactory.close();
+            driverFactory.noMoreDrivers();
         }
 
         return ImmutableList.copyOf(drivers);
@@ -709,9 +719,9 @@ public class LocalQueryRunner
 
     public Plan createPlan(Session session, @Language("SQL") String sql, LogicalPlanner.Stage stage, boolean forceSingleNode)
     {
-        Statement statement = unwrapExecuteStatement(sqlParser.createStatement(sql), sqlParser, session);
+        Statement statement = unwrapExecuteStatement(sqlParser.createStatement(sql, createParsingOptions(session)), sqlParser, session);
 
-        assertFormattedSql(sqlParser, statement);
+        assertFormattedSql(sqlParser, createParsingOptions(session), statement);
 
         return createPlan(session, sql, getPlanOptimizers(forceSingleNode), stage);
     }
@@ -731,7 +741,7 @@ public class LocalQueryRunner
 
     public Plan createPlan(Session session, @Language("SQL") String sql, List<PlanOptimizer> optimizers, LogicalPlanner.Stage stage)
     {
-        Statement wrapped = sqlParser.createStatement(sql);
+        Statement wrapped = sqlParser.createStatement(sql, createParsingOptions(session));
         Statement statement = unwrapExecuteStatement(wrapped, sqlParser, session);
 
         List<Expression> parameters = emptyList();
@@ -740,7 +750,7 @@ public class LocalQueryRunner
         }
         validateParameters(statement, parameters);
 
-        assertFormattedSql(sqlParser, statement);
+        assertFormattedSql(sqlParser, createParsingOptions(session), statement);
 
         PlanNodeIdAllocator idAllocator = new PlanNodeIdAllocator();
 
@@ -809,7 +819,7 @@ public class LocalQueryRunner
             }
 
             @Override
-            public void close()
+            public void noMoreOperators()
             {
             }
 
@@ -821,7 +831,7 @@ public class LocalQueryRunner
         };
     }
 
-    public OperatorFactory createHashProjectOperator(int operatorId, PlanNodeId planNodeId, List<Type> columnTypes)
+    public OperatorFactory createHashProjectOperator(Session session, int operatorId, PlanNodeId planNodeId, List<Type> columnTypes)
     {
         ImmutableMap.Builder<Symbol, Type> symbolTypes = ImmutableMap.builder();
         ImmutableMap.Builder<Symbol, Integer> symbolToInputMapping = ImmutableMap.builder();
@@ -853,7 +863,9 @@ public class LocalQueryRunner
                 operatorId,
                 planNodeId,
                 () -> new PageProcessor(Optional.empty(), projections.build()),
-                ImmutableList.copyOf(Iterables.concat(columnTypes, ImmutableList.of(BIGINT))));
+                ImmutableList.copyOf(Iterables.concat(columnTypes, ImmutableList.of(BIGINT))),
+                getFilterAndProjectMinOutputPageSize(session),
+                getFilterAndProjectMinOutputPageRowCount(session));
     }
 
     private Split getLocalQuerySplit(Session session, TableLayoutHandle handle)

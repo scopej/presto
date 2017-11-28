@@ -18,13 +18,18 @@ import com.facebook.presto.hive.AbstractTestHiveClient.HiveTransaction;
 import com.facebook.presto.hive.AbstractTestHiveClient.Transaction;
 import com.facebook.presto.hive.HdfsEnvironment.HdfsContext;
 import com.facebook.presto.hive.authentication.NoHdfsAuthentication;
-import com.facebook.presto.hive.metastore.BridgingHiveMetastore;
 import com.facebook.presto.hive.metastore.CachingHiveMetastore;
 import com.facebook.presto.hive.metastore.Database;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.PrincipalPrivileges;
 import com.facebook.presto.hive.metastore.Table;
-import com.facebook.presto.hive.metastore.ThriftHiveMetastore;
+import com.facebook.presto.hive.metastore.thrift.BridgingHiveMetastore;
+import com.facebook.presto.hive.metastore.thrift.HiveCluster;
+import com.facebook.presto.hive.metastore.thrift.TestingHiveCluster;
+import com.facebook.presto.hive.metastore.thrift.ThriftHiveMetastore;
+import com.facebook.presto.hive.s3.HiveS3Config;
+import com.facebook.presto.hive.s3.PrestoS3ConfigurationUpdater;
+import com.facebook.presto.hive.s3.S3ConfigurationUpdater;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
@@ -58,6 +63,7 @@ import com.google.common.net.HostAndPort;
 import io.airlift.concurrent.BoundedExecutor;
 import io.airlift.json.JsonCodec;
 import io.airlift.slice.Slice;
+import io.airlift.stats.CounterStat;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.testng.annotations.AfterClass;
@@ -150,34 +156,33 @@ public abstract class AbstractTestHiveClientS3
 
         setupHive(databaseName);
 
-        HiveS3Config s3Config = new HiveS3Config()
+        S3ConfigurationUpdater s3Config = new PrestoS3ConfigurationUpdater(new HiveS3Config()
                 .setS3AwsAccessKey(awsAccessKey)
-                .setS3AwsSecretKey(awsSecretKey);
+                .setS3AwsSecretKey(awsSecretKey));
 
-        HiveClientConfig hiveClientConfig = new HiveClientConfig();
+        HiveClientConfig config = new HiveClientConfig();
         String proxy = System.getProperty("hive.metastore.thrift.client.socks-proxy");
         if (proxy != null) {
-            hiveClientConfig.setMetastoreSocksProxy(HostAndPort.fromString(proxy));
+            config.setMetastoreSocksProxy(HostAndPort.fromString(proxy));
         }
 
         HiveConnectorId connectorId = new HiveConnectorId("hive-test");
-        HiveCluster hiveCluster = new TestingHiveCluster(hiveClientConfig, host, port);
+        HiveCluster hiveCluster = new TestingHiveCluster(config, host, port);
         ExecutorService executor = newCachedThreadPool(daemonThreadsNamed("hive-s3-%s"));
-        HdfsConfiguration hdfsConfiguration = new HiveHdfsConfiguration(new HdfsConfigurationUpdater(hiveClientConfig, s3Config));
-        HivePartitionManager hivePartitionManager = new HivePartitionManager(connectorId, TYPE_MANAGER, hiveClientConfig);
+        HdfsConfiguration hdfsConfiguration = new HiveHdfsConfiguration(new HdfsConfigurationUpdater(config, s3Config));
+        HivePartitionManager hivePartitionManager = new HivePartitionManager(TYPE_MANAGER, config);
 
-        hdfsEnvironment = new HdfsEnvironment(hdfsConfiguration, hiveClientConfig, new NoHdfsAuthentication());
+        hdfsEnvironment = new HdfsEnvironment(hdfsConfiguration, config, new NoHdfsAuthentication());
         metastoreClient = new TestingHiveMetastore(
                 new BridgingHiveMetastore(new ThriftHiveMetastore(hiveCluster)),
                 executor,
-                hiveClientConfig,
+                config,
                 writableBucket,
                 hdfsEnvironment);
         locationService = new HiveLocationService(hdfsEnvironment);
         JsonCodec<PartitionUpdate> partitionUpdateCodec = JsonCodec.jsonCodec(PartitionUpdate.class);
         metadataFactory = new HiveMetadataFactory(
-                connectorId,
-                hiveClientConfig,
+                config,
                 metastoreClient,
                 hdfsEnvironment,
                 hivePartitionManager,
@@ -190,20 +195,22 @@ public abstract class AbstractTestHiveClientS3
                 new NodeVersion("test_version"));
         transactionManager = new HiveTransactionManager();
         splitManager = new HiveSplitManager(
-                connectorId,
                 transactionHandle -> ((HiveMetadata) transactionManager.get(transactionHandle)).getMetastore(),
                 new NamenodeStats(),
                 hdfsEnvironment,
                 new HadoopDirectoryLister(),
-                new BoundedExecutor(executor, hiveClientConfig.getMaxSplitIteratorThreads()),
+                new BoundedExecutor(executor, config.getMaxSplitIteratorThreads()),
                 new HiveCoercionPolicy(TYPE_MANAGER),
-                hiveClientConfig.getMaxOutstandingSplits(),
-                hiveClientConfig.getMinPartitionBatchSize(),
-                hiveClientConfig.getMaxPartitionBatchSize(),
-                hiveClientConfig.getMaxInitialSplits(),
-                hiveClientConfig.getRecursiveDirWalkerEnabled());
+                new CounterStat(),
+                config.getMaxOutstandingSplits(),
+                config.getMaxOutstandingSplitsSize(),
+                config.getMinPartitionBatchSize(),
+                config.getMaxPartitionBatchSize(),
+                config.getMaxInitialSplits(),
+                config.getSplitLoaderConcurrency(),
+                config.getRecursiveDirWalkerEnabled());
         pageSinkProvider = new HivePageSinkProvider(
-                getDefaultHiveFileWriterFactories(hiveClientConfig),
+                getDefaultHiveFileWriterFactories(config),
                 hdfsEnvironment,
                 metastoreClient,
                 new GroupByHashPageIndexerFactory(new JoinCompiler()),
@@ -213,8 +220,9 @@ public abstract class AbstractTestHiveClientS3
                 partitionUpdateCodec,
                 new TestingNodeManager("fake-environment"),
                 new HiveEventClient(),
-                new HiveSessionProperties(hiveClientConfig));
-        pageSourceProvider = new HivePageSourceProvider(hiveClientConfig, hdfsEnvironment, getDefaultHiveRecordCursorProvider(hiveClientConfig), getDefaultHiveDataStreamFactories(hiveClientConfig), TYPE_MANAGER);
+                new HiveSessionProperties(config),
+                new HiveWriterStats());
+        pageSourceProvider = new HivePageSourceProvider(config, hdfsEnvironment, getDefaultHiveRecordCursorProvider(config), getDefaultHiveDataStreamFactories(config), TYPE_MANAGER);
     }
 
     protected ConnectorSession newSession()

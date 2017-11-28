@@ -29,10 +29,10 @@ import com.facebook.presto.spi.block.LazyBlock;
 import com.facebook.presto.spi.block.LazyBlockLoader;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.TypeManager;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.List;
 
 import static com.facebook.presto.hive.HiveColumnHandle.ColumnType.REGULAR;
@@ -110,12 +110,6 @@ public class OrcPageSource
     }
 
     @Override
-    public long getTotalBytes()
-    {
-        return recordReader.getSplitLength();
-    }
-
-    @Override
     public long getCompletedBytes()
     {
         return orcDataSource.getReadBytes();
@@ -180,7 +174,7 @@ public class OrcPageSource
             recordReader.close();
         }
         catch (IOException e) {
-            throw Throwables.propagate(e);
+            throw new UncheckedIOException(e);
         }
     }
 
